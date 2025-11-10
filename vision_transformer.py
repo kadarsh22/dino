@@ -20,6 +20,9 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn as nn
+import torch.nn.functional as F
+import torch
 
 from utils import trunc_normal_
 
@@ -44,6 +47,51 @@ class DropPath(nn.Module):
 
     def forward(self, x):
         return drop_path(x, self.drop_prob, self.training)
+
+
+
+class LinearProbe(nn.Module):
+
+    def __init__(self, n_embd, n_classes):
+        super().__init__()
+        self.ln = nn.LayerNorm(n_embd * 1, bias=True)
+        self.lm = nn.Linear(n_embd * 1, n_classes, bias=True)
+        self.apply(self._init_weights)
+
+    def forward(self, x, target):
+        x = self.ln(x)
+        logits = self.lm(x)
+        loss = F.cross_entropy(logits, target)
+        return logits, loss
+
+    @torch.no_grad()
+    def reinit(self, seed = 4, sync_ddp: bool = False):
+        """Reinitialize parameters in-place using the custom scheme.
+        If seed is provided, uses it for deterministic (and DDP-consistent) init.
+        If sync_ddp=True and torch.distributed is initialized, broadcasts params from rank 0.
+        """
+        if seed is not None:
+            # make init deterministic without disturbing global RNG
+            with torch.random.fork_rng(devices=list(range(torch.cuda.device_count()))):
+                torch.manual_seed(seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed)
+                self.apply(self._init_weights)
+        else:
+            self.apply(self._init_weights)
+
+        if sync_ddp and torch.distributed.is_available() and torch.distributed.is_initialized():
+            for p in self.parameters():
+                torch.distributed.broadcast(p, src=0)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear) or isinstance(module, nn.Conv2d):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.ones_(module.weight)
+            nn.init.zeros_(module.bias)
 
 
 class Mlp(nn.Module):

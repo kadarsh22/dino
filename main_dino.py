@@ -19,6 +19,7 @@ import time
 import math
 import json
 from pathlib import Path
+import wandb
 
 import numpy as np
 from PIL import Image
@@ -29,14 +30,19 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
-
+from helper import compute_attribute_wise_acc_cached, compute_other_metrics
 import utils
 import vision_transformer as vits
-from vision_transformer import DINOHead
+from vision_transformer import DINOHead, LinearProbe
+from torch.utils.data import random_split
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(torchvision_models.__dict__[name]))
+
+def is_main_process() -> bool:
+    """Check if current process is the main (rank 0) process."""
+    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DINO', add_help=False)
@@ -117,7 +123,7 @@ def get_args_parser():
         Used for small local view cropping of multi-crop.""")
 
     # Misc
-    parser.add_argument('--data_path', default='/path/to/imagenet/train/', type=str,
+    parser.add_argument('--data_path', default='/user/HS502/ak03476/PycharmProjects/vision-transformers-cifar10/data', type=str,
         help='Please specify path to the ImageNet training data.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
@@ -130,6 +136,15 @@ def get_args_parser():
 
 
 def train_dino(args):
+
+    if is_main_process():
+        wandb.init(
+            project="ijepa-cmnist",  # set your project name here
+            name='dino',
+            config=args
+        )
+        # wandb.run.log_code('/leonardo/home/userexternal/akappiya/projects/ijepa')
+
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
     print("git:\n  {}\n".format(utils.get_sha()))
@@ -142,7 +157,14 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    # dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    dataset = datasets.CIFAR10(
+        root=args.data_path,
+        train=True,
+        transform=transform,
+        download=False,
+    )
+
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -190,6 +212,48 @@ def train_dino(args):
         teacher,
         DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
     )
+
+    linear_probe = LinearProbe(n_embd=384, n_classes=10)
+
+    train_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    ])
+
+    unbiased_dataset = datasets.CIFAR10(
+        root=args.data_path,
+        train=False,
+        transform=train_transform,
+        download=False,
+    )
+
+    train_size = int(0.8 * len(unbiased_dataset))
+    test_size = int(0.2 * len(unbiased_dataset))
+
+    g = torch.Generator()
+    g.manual_seed(0)  # or your global seed
+    unbiased_train_dataset, unbiased_test_dataset = random_split(unbiased_dataset,
+                                                                 [train_size, test_size], generator=g)
+
+    sampler = torch.utils.data.DistributedSampler(unbiased_train_dataset, shuffle=True)
+    unbiased_train_data_loader = torch.utils.data.DataLoader(
+        unbiased_train_dataset,
+        sampler=sampler,
+        batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,)
+
+    sampler = torch.utils.data.DistributedSampler(unbiased_test_dataset, shuffle=True)
+    unbiased_test_data_loader = torch.utils.data.DataLoader(
+        unbiased_test_dataset,
+        sampler=sampler,
+        batch_size=args.batch_size_per_gpu,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True,)
+
+
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
     # synchronize batch norms (if any)
@@ -204,6 +268,7 @@ def train_dino(args):
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
     student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    device = student.device
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
@@ -269,10 +334,21 @@ def train_dino(args):
     for epoch in range(start_epoch, args.epochs):
         data_loader.sampler.set_epoch(epoch)
 
+        linear_probe.reinit()
+        acc, lm_probe = compute_attribute_wise_acc_cached(device,
+                                           teacher, linear_probe,
+                                           unbiased_train_data_loader, unbiased_test_data_loader,)
+
         # ============ training one epoch of DINO ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss,
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args)
+
+
+
+        wandb.log({
+            "online/acc(teacher)": acc,
+        })
 
         # ============ writing logs ... ============
         save_dict = {
