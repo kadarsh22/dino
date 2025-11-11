@@ -1,0 +1,46 @@
+#!/bin/bash
+#SBATCH --job-name=multinode_ijepa
+#SBATCH --nodes=4
+#SBATCH --ntasks=4                # one task per node
+#SBATCH --ntasks-per-node=1
+#SBATCH --gpus-per-task=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=64G                 # per node
+#SBATCH --partition=boost_usr_prod
+#SBATCH --time=01-00:00:00
+#SBATCH -o slurm_outputs/%x_%j.out
+#SBATCH -e slurm_outputs/%x_%j.err
+
+set -euo pipefail
+mkdir -p slurm_outputs
+
+# Rendezvous address = first hostname in the allocation
+MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)
+MASTER_PORT=29500
+
+export LOGLEVEL=INFO
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export NCCL_DEBUG=WARN
+# If your fabric needs it, uncomment with the right iface:
+# export NCCL_SOCKET_IFNAME=ib0
+
+# Pass WANDB into the container via env (don’t hardcode in the file):
+# export SINGULARITYENV_WANDB_API_KEY=...   # set this in your shell or sbatch --export
+export SINGULARITYENV_WANDB_MODE=offline
+export SINGULARITYENV_WANDB_NOTES="Training ijepa cifar10"
+export SINGULARITYENV_SLURM_JOB_ID="${SLURM_JOB_ID}"
+export SINGULARITYENV_SLURM_ARRAY_JOB_ID="${SLURM_ARRAY_JOB_ID:-}"
+export SINGULARITYENV_SLURM_ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-}"
+
+IMG=/leonardo_work/EUHPC_D27_070/apptainer/ijepa_reptrix.sif
+BIND="--bind /leonardo_work:/leonardo_work:rw"
+
+# Launch one containerized torchrun per node
+srun singularity exec --nv $BIND "$IMG" \
+  torchrun \
+    --nnodes="$SLURM_NNODES" \
+    --nproc_per_node=1 \
+    --rdzv_backend=c10d \
+    --rdzv_endpoint="${MASTER_ADDR}:${MASTER_PORT}" \
+    --rdzv_id="${SLURM_JOB_ID}" \
+    main_dino.py --output_dir /leonardo_work/EUHPC_D27_070/dino/poe

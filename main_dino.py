@@ -40,17 +40,21 @@ torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(torchvision_models.__dict__[name]))
 
+def get_rank_safe() -> int:
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_rank()
+    # Fallback for launchers that set RANK early
+    return int(os.environ.get("RANK", "0"))
+
 def is_main_process() -> bool:
-    """Check if current process is the main (rank 0) process."""
-    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+    return get_rank_safe() == 0
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DINO', add_help=False)
 
     # Model parameters
     parser.add_argument('--arch', default='vit_small', type=str,
-        choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small'] \
-                + torchvision_archs + torch.hub.list("facebookresearch/xcit:main"),
+        choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small'],
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
     parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
@@ -123,7 +127,7 @@ def get_args_parser():
         Used for small local view cropping of multi-crop.""")
 
     # Misc
-    parser.add_argument('--data_path', default='/user/HS502/ak03476/PycharmProjects/vision-transformers-cifar10/data', type=str,
+    parser.add_argument('--data_path', default='/leonardo_work/EUHPC_D27_070/data/cifar/CIFAR10', type=str,
         help='Please specify path to the ImageNet training data.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
@@ -143,7 +147,7 @@ def train_dino(args):
             name='dino',
             config=args
         )
-        # wandb.run.log_code('/leonardo/home/userexternal/akappiya/projects/ijepa')
+        wandb.run.log_code('/leonardo/home/userexternal/akappiya/projects/dino')
 
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
@@ -210,7 +214,7 @@ def train_dino(args):
     else:
         print(f"Unknow architecture: {args.arch}")
 
-    pretrained_weights = torch.load('/vol/research/project_storage/dino/output/checkpoint.pth')
+    pretrained_weights = torch.load('/leonardo/home/userexternal/akappiya/projects/checkpoint.pth')
 
     state_dict_student = pretrained_weights['student']
     state_dict_student = {k.replace("module.", ""): v for k, v in state_dict_student.items()}
@@ -376,7 +380,10 @@ def train_dino(args):
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args)
 
-
+        print(
+            f"online_joint/acc(teacher): {acc_joint:.4f}, "
+            f"online_new_branch/acc(teacher): {acc_new_branch:.4f}"
+        )
 
         wandb.log({
             "online_joint/acc(teacher)": acc_joint,

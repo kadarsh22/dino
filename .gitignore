@@ -1,0 +1,4 @@
+__pycache__
+wandb
+slurm_outputs
+pretrained_weights

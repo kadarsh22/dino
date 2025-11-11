@@ -77,7 +77,7 @@ def compute_attribute_wise_acc_cached(
     if cache_dir is None:
         job_id   = os.getenv("SLURM_JOB_ID")
         cache_dir = "/leonardo_work/EUHPC_D27_070/cache/" + str(job_id)
-        cache_dir = "/vol/research/project_storage/cache/"
+        # cache_dir = "/vol/research/project_storage/cache/"
     os.makedirs(cache_dir, exist_ok=True)
 
     # 2) Extract & cache only on rank0; others wait then load
