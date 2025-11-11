@@ -49,8 +49,7 @@ def get_args_parser():
 
     # Model parameters
     parser.add_argument('--arch', default='vit_small', type=str,
-        choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small'] \
-                + torchvision_archs + torch.hub.list("facebookresearch/xcit:main"),
+        choices=['vit_tiny', 'vit_small', 'vit_base', 'xcit', 'deit_tiny', 'deit_small'],
         help="""Name of architecture to train. For quick experiments with ViTs,
         we recommend using vit_tiny or vit_small.""")
     parser.add_argument('--patch_size', default=16, type=int, help="""Size in pixels
@@ -123,7 +122,7 @@ def get_args_parser():
         Used for small local view cropping of multi-crop.""")
 
     # Misc
-    parser.add_argument('--data_path', default='/user/HS502/ak03476/PycharmProjects/vision-transformers-cifar10/data', type=str,
+    parser.add_argument('--data_path', default='/leonardo_work/EUHPC_D27_070/data/cifar/CIFAR10', type=str,
         help='Please specify path to the ImageNet training data.')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
@@ -143,7 +142,7 @@ def train_dino(args):
             name='dino',
             config=args
         )
-        # wandb.run.log_code('/leonardo/home/userexternal/akappiya/projects/ijepa')
+        wandb.run.log_code('/leonardo/home/userexternal/akappiya/projects/dino')
 
     utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
