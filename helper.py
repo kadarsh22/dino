@@ -38,7 +38,7 @@ def _extract_and_cache(encoder, loader, device, cache_dir, split):
     encoder.eval()
     for data, attr in loader:
         data = data.to(device, non_blocking=True)
-        x = encoder.backbone(data)                         # [B,T,C] or [B,C]
+        x = encoder.backbone(data)                         # [B,T,C] or [B,C] ##TODO
         # x = feats.mean(dim=1) if feats.dim() == 3 else feats
         x = F.normalize(x, dim=1)
         X_chunks.append(x.cpu())
