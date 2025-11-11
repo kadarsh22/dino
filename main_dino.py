@@ -222,6 +222,16 @@ def train_dino(args):
     state_dict_student = {k.replace("backbone.", ""): v for k, v in state_dict_student.items()}
     msg = student_pretrained.load_state_dict(state_dict_student,strict=False)
     print('Pretrained loaded with msg: {}'.format(msg))
+    head_pretrained_student = DINOHead(
+        embed_dim,
+        args.out_dim,
+        use_bn=args.use_bn_in_head,
+        norm_last_layer=args.norm_last_layer,)
+    state_dict_student = {k.replace("head.", ""): v for k, v in state_dict_student.items()}
+    head_pretrained_student.load_state_dict(state_dict_student, strict=False)
+
+    for p in head_pretrained_student.parameters():
+        p.requires_grad = False
 
     state_dict_teacher = pretrained_weights['teacher']
     state_dict_teacher = {k.replace("module.", ""): v for k, v in state_dict_teacher.items()}
@@ -229,17 +239,28 @@ def train_dino(args):
     state_dict_teacher = {k.replace("backbone.", ""): v for k, v in state_dict_teacher.items()}
     msg = teacher_pretrained.load_state_dict(state_dict_teacher,strict=False)
     print('Pretrained weights oaded with msg: {}'.format(msg))
+    head_pretrained_teacher = DINOHead(
+        embed_dim,
+        args.out_dim,
+        use_bn=args.use_bn_in_head,
+        norm_last_layer=args.norm_last_layer,)
+    state_dict_teacher = {k.replace("head.", ""): v for k, v in state_dict_teacher.items()}
+    head_pretrained_teacher.load_state_dict(state_dict_teacher, strict=False)
+
+    for p in head_pretrained_teacher.parameters():
+        p.requires_grad = False
 
     student = utils.MultiCropWrapper(student, student_pretrained, DINOHead(
         embed_dim,
         args.out_dim,
         use_bn=args.use_bn_in_head,
-        norm_last_layer=args.norm_last_layer,
-    ))
+        norm_last_layer=args.norm_last_layer, ), head_pretrained_student)
+
     teacher = utils.MultiCropWrapper(
         teacher,
         teacher_pretrained,
         DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
+        head_pretrained_teacher
     )
 
     linear_probe = LinearProbe(n_embd=384, n_classes=10)
@@ -314,6 +335,7 @@ def train_dino(args):
         args.warmup_teacher_temp_epochs,
         args.epochs,
     ).cuda()
+    dino_loss.center_pretrained = pretrained_weights['dino_loss']['center']
 
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
@@ -368,13 +390,6 @@ def train_dino(args):
                                            teacher, linear_probe,
                                            unbiased_train_data_loader, unbiased_test_data_loader,)
 
-        linear_probe.reinit()
-        teacher.backbone_pretrained_weight = 0
-        acc_new_branch, lm_probe = compute_attribute_wise_acc_cached(device,
-                                           teacher, linear_probe,
-                                           unbiased_train_data_loader, unbiased_test_data_loader,)
-        teacher.backbone_pretrained_weight = 1
-
         # ============ training one epoch of DINO ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss,
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
@@ -382,12 +397,10 @@ def train_dino(args):
 
         print(
             f"online_joint/acc(teacher): {acc_joint:.4f}, "
-            f"online_new_branch/acc(teacher): {acc_new_branch:.4f}"
         )
 
         wandb.log({
             "online_joint/acc(teacher)": acc_joint,
-            "online_new_branch/acc(teacher)": acc_new_branch,
         })
 
         # ============ writing logs ... ============
@@ -431,9 +444,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         images = [im.cuda(non_blocking=True) for im in images]
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
-            loss = dino_loss(student_output, teacher_output, epoch)
+            teacher_output, teacher_output_pretrained = teacher(images[:2])  # only the 2 global views pass through the teacher
+            student_output, student_output_pretrained = student(images)
+            loss = dino_loss(student_output, teacher_output, student_output_pretrained, teacher_output_pretrained, epoch)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -463,7 +476,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         with torch.no_grad():
             m = momentum_schedule[it]  # momentum parameter
             for (name_q, param_q), (name_k, param_k) in zip(student.module.named_parameters(), teacher_without_ddp.named_parameters()):
-                if name_k.split('.')[0] == 'backbone_pretrained':
+                if name_k.split('.')[0] in ('backbone_pretrained', 'head_pretrained'):
                     continue
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
@@ -487,6 +500,7 @@ class DINOLoss(nn.Module):
         self.center_momentum = center_momentum
         self.ncrops = ncrops
         self.register_buffer("center", torch.zeros(1, out_dim))
+        self.register_buffer("center_pretrained", torch.zeros(1, out_dim))  # NEW
         # we apply a warm up for the teacher temperature because
         # a too high temperature makes the training instable at the beginning
         self.teacher_temp_schedule = np.concatenate((
@@ -495,43 +509,59 @@ class DINOLoss(nn.Module):
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
         ))
 
-    def forward(self, student_output, teacher_output, epoch):
+    def forward(self, student_output, teacher_output, student_output_pretrained, teacher_output_pretrained, epoch):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
+        student_out_pretrained = student_output_pretrained / self.student_temp
         student_out = student_output / self.student_temp
-        student_out = student_out.chunk(self.ncrops)
+
+        p_sA = F.softmax(student_out_pretrained , dim=-1)  # probs
+        p_sB = F.softmax(student_out, dim=-1)
+
+        log_mix = 0.5 * torch.log(p_sA + 1e-12) + 0.5 * torch.log(p_sB + 1e-12)
+        p_s = F.softmax(log_mix / 0.15, dim=-1)
+        p_s_chunk = p_s.chunk(self.ncrops)
 
         # teacher centering and sharpening
         temp = self.teacher_temp_schedule[epoch]
-        teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
-        teacher_out = teacher_out.detach().chunk(2)
+        p_tA = F.softmax((teacher_output_pretrained - self.center_pretrained) / temp, dim=-1)
+        p_tB = F.softmax((teacher_output - self.center) / temp, dim=-1)
+
+        log_mix_t = 0.5 * torch.log(p_tA + 1e-12) + 0.5 * torch.log(p_tB + 1e-12)
+        p_t = F.softmax(log_mix_t / 0.15, dim=-1).detach()  # STOP-GRAD target
+        p_t_chunks = p_t.chunk(2)  # two global crops
 
         total_loss = 0
         n_loss_terms = 0
-        for iq, q in enumerate(teacher_out):
-            for v in range(len(student_out)):
+        for iq, q in enumerate(p_t_chunks):
+            for v in range(len(p_s_chunk)):
                 if v == iq:
                     # we skip cases where student and teacher operate on the same view
                     continue
-                loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
+                loss = torch.sum(-q * torch.log(p_s_chunk[v]), dim=-1)
                 total_loss += loss.mean()
                 n_loss_terms += 1
         total_loss /= n_loss_terms
         self.update_center(teacher_output)
+        self.update_center_pretrained(teacher_output_pretrained)
         return total_loss
 
     @torch.no_grad()
-    def update_center(self, teacher_output):
-        """
-        Update center used for teacher output.
-        """
-        batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
-        dist.all_reduce(batch_center)
-        batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
+    def update_center(self, raw_logits):
+        batch_center = raw_logits.mean(dim=0, keepdim=True)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(batch_center)
+            batch_center /= dist.get_world_size()
+        self.center.mul_(self.center_momentum).add_((1 - self.center_momentum) * batch_center)
 
-        # ema update
-        self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
+    @torch.no_grad()
+    def update_center_pretrained(self, raw_logits):
+        batch_center = raw_logits.mean(dim=0, keepdim=True)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(batch_center)
+            batch_center /= dist.get_world_size()
+        self.center_pretrained.mul_(self.center_momentum).add_((1 - self.center_momentum) * batch_center)
 
 
 class DataAugmentationDINO(object):
