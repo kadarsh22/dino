@@ -185,7 +185,16 @@ def train_dino(args):
             patch_size=args.patch_size,
             drop_path_rate=args.drop_path_rate,  # stochastic depth
         )
+        student_pretrained = vits.__dict__[args.arch](
+            patch_size=args.patch_size,
+            drop_path_rate=args.drop_path_rate,  # stochastic depth
+        )
+        for p in student_pretrained.parameters():
+            p.requires_grad = False
         teacher = vits.__dict__[args.arch](patch_size=args.patch_size)
+        teacher_pretrained = vits.__dict__[args.arch](patch_size=args.patch_size)
+        for p in teacher_pretrained.parameters():
+            p.requires_grad = False
         embed_dim = student.embed_dim
     # if the network is a XCiT
     elif args.arch in torch.hub.list("facebookresearch/xcit:main"):
@@ -201,8 +210,23 @@ def train_dino(args):
     else:
         print(f"Unknow architecture: {args.arch}")
 
-    # multi-crop wrapper handles forward with inputs of different resolutions
-    student = utils.MultiCropWrapper(student, DINOHead(
+    pretrained_weights = torch.load('/vol/research/project_storage/dino/output/checkpoint.pth')
+
+    state_dict_student = pretrained_weights['student']
+    state_dict_student = {k.replace("module.", ""): v for k, v in state_dict_student.items()}
+    # remove `backbone.` prefix induced by multicrop wrapper
+    state_dict_student = {k.replace("backbone.", ""): v for k, v in state_dict_student.items()}
+    msg = student_pretrained.load_state_dict(state_dict_student,strict=False)
+    print('Pretrained loaded with msg: {}'.format(msg))
+
+    state_dict_teacher = pretrained_weights['teacher']
+    state_dict_teacher = {k.replace("module.", ""): v for k, v in state_dict_teacher.items()}
+    # remove `backbone.` prefix induced by multicrop wrapper
+    state_dict_teacher = {k.replace("backbone.", ""): v for k, v in state_dict_teacher.items()}
+    msg = teacher_pretrained.load_state_dict(state_dict_teacher,strict=False)
+    print('Pretrained weights oaded with msg: {}'.format(msg))
+
+    student = utils.MultiCropWrapper(student, student_pretrained, DINOHead(
         embed_dim,
         args.out_dim,
         use_bn=args.use_bn_in_head,
@@ -210,6 +234,7 @@ def train_dino(args):
     ))
     teacher = utils.MultiCropWrapper(
         teacher,
+        teacher_pretrained,
         DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
     )
 
@@ -318,15 +343,15 @@ def train_dino(args):
 
     # ============ optionally resume training ... ============
     to_restore = {"epoch": 0}
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth"),
-        run_variables=to_restore,
-        student=student,
-        teacher=teacher,
-        optimizer=optimizer,
-        fp16_scaler=fp16_scaler,
-        dino_loss=dino_loss,
-    )
+    # utils.restart_from_checkpoint(
+    #     os.path.join(args.output_dir, "checkpoint.pth"),
+    #     run_variables=to_restore,
+    #     student=student,
+    #     teacher=teacher,
+    #     optimizer=optimizer,
+    #     fp16_scaler=fp16_scaler,
+    #     dino_loss=dino_loss,
+    # )
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
@@ -335,9 +360,16 @@ def train_dino(args):
         data_loader.sampler.set_epoch(epoch)
 
         linear_probe.reinit()
-        acc, lm_probe = compute_attribute_wise_acc_cached(device,
+        acc_joint, lm_probe = compute_attribute_wise_acc_cached(device,
                                            teacher, linear_probe,
                                            unbiased_train_data_loader, unbiased_test_data_loader,)
+
+        linear_probe.reinit()
+        teacher.backbone_pretrained_weight = 0
+        acc_new_branch, lm_probe = compute_attribute_wise_acc_cached(device,
+                                           teacher, linear_probe,
+                                           unbiased_train_data_loader, unbiased_test_data_loader,)
+        teacher.backbone_pretrained_weight = 1
 
         # ============ training one epoch of DINO ... ============
         train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss,
@@ -347,7 +379,8 @@ def train_dino(args):
 
 
         wandb.log({
-            "online/acc(teacher)": acc,
+            "online_joint/acc(teacher)": acc_joint,
+            "online_new_branch/acc(teacher)": acc_new_branch,
         })
 
         # ============ writing logs ... ============
@@ -422,7 +455,9 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         # EMA update for the teacher
         with torch.no_grad():
             m = momentum_schedule[it]  # momentum parameter
-            for param_q, param_k in zip(student.module.parameters(), teacher_without_ddp.parameters()):
+            for (name_q, param_q), (name_k, param_k) in zip(student.module.named_parameters(), teacher_without_ddp.named_parameters()):
+                if name_k.split('.')[0] == 'backbone_pretrained':
+                    continue
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
         # logging
