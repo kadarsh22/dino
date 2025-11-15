@@ -398,10 +398,10 @@ def train_dino(args):
         print(
             f"online_joint/acc(teacher): {acc_joint:.4f}, "
         )
-
-        wandb.log({
-            "online_joint/acc(teacher)": acc_joint,
-        })
+        if is_main_process():
+            wandb.log({
+                "online_joint/acc(teacher)": acc_joint,
+            })
 
         # ============ writing logs ... ============
         save_dict = {
