@@ -58,9 +58,12 @@ def _load_cached(cache_dir, split, map_location="cpu"):
 def compute_attribute_wise_acc_cached(
     device,
     encoder,
-    lm_probe,
+    lm_probe_digit,
+    lm_probe_color,
     unbiased_train_loader,
     unbiased_test_loader,
+    unbiased_train_sampler=None,   # not needed anymore, but kept for signature compatibility
+    unbiased_test_sampler=None,    # not needed
     cache_dir=None,
     epochs=100,
     batch_size=4096,
@@ -105,61 +108,76 @@ def compute_attribute_wise_acc_cached(
     )
 
     # 5) Optimizer over probe params only
-    lm_probe.to(device)
-    lm_probe.train()
+    lm_probe_digit.to(device)
+    lm_probe_color.to(device)
+    lm_probe_digit.train()
+    lm_probe_color.train()
 
     optimizer = torch.optim.Adam(
-        lm_probe.parameters(),
+        list(lm_probe_digit.parameters()) + list(lm_probe_color.parameters()),
         lr=lr, weight_decay=weight_decay
     )
 
     # 6) Train probes (no encoder calls now)
     for epoch in range(epochs):
-        batch_losses = []
+        batch_losses_digit = []
+        batch_losses_color = []
 
         for xb, ab in train_loader_cached:
             xb = xb.to(device, non_blocking=True)
-            y_digit = ab.to(device, non_blocking=True)
+            y_digit = ab[:, 0].to(device, non_blocking=True)
+            y_color = ab[:, 1].to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
             # Your probes return (logits, loss) when given (x, label)
-            _, loss = lm_probe(xb, y_digit)
+            _, loss_digit = lm_probe_digit(xb, y_digit)
+            _, loss_color = lm_probe_color(xb, y_color)
+            loss = loss_digit + loss_color
             loss.backward()
             optimizer.step()
-            batch_losses.append(loss.item())
+            batch_losses_digit.append(loss_digit.item())
+            batch_losses_color.append(loss_color.item())
 
         if os.getenv("RANK", "0") == "0":
-            wandb.log({"eval_lm_probe/train_loss": sum(batch_losses) / max(1, len(batch_losses))})
+            wandb.log({"eval_lm_probe/train_loss_digit": sum(batch_losses_digit) / max(1, len(batch_losses_digit))})
+            wandb.log({"eval_lm_probe/train_loss_color": sum(batch_losses_color) / max(1, len(batch_losses_color))})
 
     # 7) Eval (again, no encoder calls)
-    lm_probe.eval()
+    lm_probe_digit.eval()
+    lm_probe_color.eval()
 
     test_loader_cached = DataLoader(
         TensorDataset(Xte, Ate),
         batch_size=batch_size, shuffle=False, drop_last=False, pin_memory=True
     )
 
-    correct= torch.tensor(0, device=device, dtype=torch.long)
+    correct_digit = torch.tensor(0, device=device, dtype=torch.long)
+    correct_color = torch.tensor(0, device=device, dtype=torch.long)
     total         = torch.tensor(0, device=device, dtype=torch.long)
 
     with torch.inference_mode():
         for xb, ab in test_loader_cached:
             xb = xb.to(device, non_blocking=True)
-            y = ab.to(device, non_blocking=True).long()
+            y_digit = ab[:, 0].to(device, non_blocking=True).long()
+            y_color = ab[:, 1].to(device, non_blocking=True).long()
 
-            logit, _ = lm_probe(xb, y)   # keep signature consistent
+            logit_digit, _ = lm_probe_digit(xb, y_digit)   # keep signature consistent
+            logit_color, _ = lm_probe_color(xb, y_color)
 
-            pred = logit.argmax(dim=1)
+            pred_digit = logit_digit.argmax(dim=1)
+            pred_color = logit_color.argmax(dim=1)
 
-            correct += (pred == y).sum()
-            total         += y.size(0)
+            correct_digit += (pred_digit == y_digit).sum()
+            correct_color += (pred_color == y_color).sum()
+            total         += y_digit.size(0)
 
     if ddp_active():
-        dist.all_reduce(correct, op=dist.ReduceOp.SUM)
+        dist.all_reduce(correct_digit, op=dist.ReduceOp.SUM)
+        dist.all_reduce(correct_color, op=dist.ReduceOp.SUM)
         dist.all_reduce(total,         op=dist.ReduceOp.SUM)
 
-    acc= (correct.float() / total.float()).item()
-
+    acc_digit = (correct_digit.float() / total.float()).item()
+    acc_color = (correct_color.float() / total.float()).item()
 
     # Restore encoder mode (even though we didn't use it during training/eval)
     encoder.train(prev_training)
@@ -182,7 +200,7 @@ def compute_attribute_wise_acc_cached(
             pass
     ddp_barrier()  # make sure deletion is complete before returning (optional)
 
-    return acc, lm_probe
+    return acc_digit, acc_color, lm_probe_digit, lm_probe_color
 
 
 def compute_other_metrics(encoder, unbiased_test_loader, unbiased_test_loader_full, device, eps=0.0,power=1, rtol=1e-12, num_augmentations=25):
